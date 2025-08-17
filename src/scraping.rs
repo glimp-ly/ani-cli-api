@@ -20,7 +20,7 @@ use tokio::task;
 
 static DNS_CACHE: Lazy<Mutex<Option<IpAddr>>> = Lazy::new(|| Mutex::new(None));
 
-pub async fn get_animeflv_ip() -> Result<IpAddr> {
+pub async fn get_animeav1_ip() -> Result<IpAddr> {
     // Verificar caché
     {
         let cache = DNS_CACHE.lock().unwrap();
@@ -35,7 +35,7 @@ pub async fn get_animeflv_ip() -> Result<IpAddr> {
         ResolverOpts::default()
     )?;
     
-    let response = resolver.lookup_ip("animeflv.net").await?;
+    let response = resolver.lookup_ip("animeav1.com").await?;
     let ip = response.iter().next().ok_or_else(|| anyhow!("No se encontró IP"))?;
     
     // Actualizar caché
@@ -47,7 +47,7 @@ pub async fn get_animeflv_ip() -> Result<IpAddr> {
     Ok(ip)
 }
 
-const BASE_URL: &str = "https://animeflv.net";
+const BASE_URL: &str = "https://animeav1.com";
 
 // Estructura personalizada para resolución DNS
 #[derive(Clone)]
@@ -89,31 +89,31 @@ pub async fn custom_client() -> Result<Client, Box<dyn Error>> {
 
 pub async fn search_anime(query: &str) -> Result<Vec<Anime>, Box<dyn Error>> {
     let client = custom_client().await?;
-    let url = format!("{}/browse?q={}", BASE_URL, query);
+    let url = format!("{}/catalogo?search={}", BASE_URL, query);
     
     let html = client.get(&url).send().await?.text().await?;
-    
     let document = Html::parse_document(&html);
 
-    // Selector corregido:
-    let selector = Selector::parse("ul.ListAnimes > li > article.Anime").unwrap();
+    // Selector corregido: cada resultado está en un <article class="group/item">
+    let selector = Selector::parse("article.group\\/item").unwrap();
     let mut results = Vec::new();
 
     for element in document.select(&selector) {
-        // Obtener el enlace
-        let link = element.select(&Selector::parse("a").unwrap()).next().unwrap();
+        // Enlace
+        let link = element.select(&Selector::parse("a[href]").unwrap()).next().unwrap();
         let url = link.value().attr("href").unwrap().to_string();
-        let id = url.split('/').last().unwrap().to_string();
-        
-        // Obtener título
-        let title = link.select(&Selector::parse("h3.Title").unwrap())
+        let id = url.split('/').last().unwrap_or("").to_string();
+
+        // Título
+        let title = element
+            .select(&Selector::parse("h3.line-clamp-2").unwrap())
             .next()
-            .unwrap()
-            .text()
-            .collect::<String>();
-        
-        // Obtener tipo
-        let typ = element.select(&Selector::parse("span.Type").unwrap())
+            .map(|e| e.text().collect::<String>())
+            .unwrap_or_else(|| "Sin título".to_string());
+
+        // Tipo (ej: TV Anime, OVA, etc.)
+        let typ = element
+            .select(&Selector::parse("div.text-2xs").unwrap())
             .next()
             .map(|e| e.text().collect::<String>())
             .unwrap_or_else(|| "Desconocido".to_string());
@@ -130,18 +130,28 @@ pub async fn search_anime(query: &str) -> Result<Vec<Anime>, Box<dyn Error>> {
 }
 
 pub async fn get_episodes(anime_id: &str) -> Result<Vec<Episode>> {
-    let ip = get_animeflv_ip().await?;
-    let domain = "www3.animeflv.net";
-    let url = format!("https://{}/anime/{}", domain, anime_id);
+    // Construye la URL destino
+    let page_url = format!("{}/media/{}", BASE_URL, anime_id);
+
+    // (opcional) resolver manual a IP si lo usas
+    let ip = get_animeav1_ip().await?;
+
+    // extrae dominio de BASE_URL para el host resolver rule
+    let domain = BASE_URL
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("animeav1.com")
+        .to_string();
 
     let episodes = task::spawn_blocking(move || -> Result<Vec<Episode>> {
-        // Construimos OsString que vivirán en esta función
+        // args del navegador
         let host_rule = format!("--host-resolver-rules=MAP {} {}", domain, ip);
-        let mut args_os: Vec<OsString> = Vec::new();
-        args_os.push(OsString::from("--no-sandbox"));
-        args_os.push(OsString::from(host_rule));
-
-        // Ahora creamos Vec<&OsStr> que referencia los OsString anteriores
+        let args_os: Vec<OsString> = vec![
+            OsString::from("--no-sandbox"),
+            OsString::from(host_rule),
+        ];
         let args_refs: Vec<&OsStr> = args_os.iter().map(|s| s.as_os_str()).collect();
 
         let launch_opts = LaunchOptions {
@@ -155,70 +165,108 @@ pub async fn get_episodes(anime_id: &str) -> Result<Vec<Episode>> {
         let browser = Browser::new(launch_opts).context("Error al crear el navegador")?;
         let tab = browser.new_tab().context("Error al abrir pestaña")?;
 
-        // Navegar a la URL
-        tab.navigate_to(&url).context("Error al navegar a la URL")?;
+        // Navegar
+        tab.navigate_to(&page_url).context("Error al navegar a la URL")?;
 
-        // Esperar a que los episodios estén cargados
-        tab.wait_for_element_with_custom_timeout("ul.ListCaps > li", Duration::from_secs(15))
-            .context("Timeout esperando episodios")?;
+        // Esperar a que aparezcan los artículos de episodios
+        // Nota: hay que escapar la barra de la clase "group/item" como group\/item
+        tab.wait_for_element_with_custom_timeout(
+            r#"article.group\/item a[href^="/media/"]"#,
+            Duration::from_secs(20),
+        )
+        .context("Timeout esperando episodios")?;
 
-        // Obtener contenido renderizado
+        // HTML renderizado
         let html = tab.get_content().context("Error al obtener contenido")?;
+        std::fs::write("episodes_page.html", &html).ok(); // útil para debug
 
-        // Parseo del HTML
+        // Parseo
         let document = Html::parse_document(&html);
-        let selector = Selector::parse("ul.ListCaps > li > a").unwrap();
-        let p_selector = Selector::parse("p").unwrap();
-        let h3_selector = Selector::parse("h3").unwrap();
+        let article_sel = Selector::parse(r#"article.group\/item"#).unwrap();
+        let link_sel = Selector::parse(r#"a[href^="/media/"]"#).unwrap();
+        let num_span_sel = Selector::parse("span.text-lead.font-bold").unwrap();
+        let sr_only_sel = Selector::parse("span.sr-only").unwrap();
 
-        let mut episodes = Vec::new();
-        for element in document.select(&selector) {
-            let episode_number_text = element
-                .select(&p_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
+        let mut episodes: Vec<Episode> = Vec::new();
 
-            let episode_number = episode_number_text
-                .replace("Episodio ", "")
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0);
+        for art in document.select(&article_sel) {
+            // Link del episodio
+            let a = match art.select(&link_sel).next() {
+                Some(n) => n,
+                None => continue,
+            };
+            let href = a.value().attr("href").unwrap_or("").to_string();
+            if href.is_empty() { continue; }
 
-            let episode_title = element
-                .select(&h3_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-
-            let href = element
-                .value()
-                .attr("href")
-                .ok_or_else(|| anyhow!("Atributo href no encontrado"))?
-                .to_string();
-
+            // URL absoluta
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else {
-                format!("https://{}{}", domain, href)
+                // construye con dominio de BASE_URL
+                let dom = BASE_URL
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or("animeav1.com");
+                format!("https://{}{}", dom, href)
             };
 
-            let id = full_url
+            // número de episodio desde el href (último segmento)
+            let number_from_href = href
                 .trim_end_matches('/')
                 .rsplit('/')
                 .next()
-                .ok_or_else(|| anyhow!("No se pudo extraer ID de la URL"))?
+                .and_then(|s| s.parse::<u32>().ok());
+
+            // fallback: span con la cifra
+            let number = number_from_href.or_else(|| {
+                art.select(&num_span_sel)
+                    .next()
+                    .and_then(|n| n.text().collect::<String>().trim().parse::<u32>().ok())
+            }).unwrap_or(0);
+
+            // id = último segmento (suele ser el número)
+            let id = href
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
                 .to_string();
+
+            // título: intenta desde el sr-only ("Ver {Titulo} {n}")
+            let title = art
+                .select(&sr_only_sel)
+                .next()
+                .map(|n| n.text().collect::<String>())
+                .map(|raw| {
+                    let t = raw.trim();
+                    let t = t.strip_prefix("Ver ").unwrap_or(t);
+                    // separa el último token numérico si coincide con nuestro number
+                    if let Some(pos) = t.rfind(' ') {
+                        let (maybe_title, maybe_num) = t.split_at(pos);
+                        if maybe_num.trim().parse::<u32>().ok() == Some(number) {
+                            maybe_title.trim().to_string()
+                        } else {
+                            t.to_string()
+                        }
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| if number > 0 { format!("Episodio {}", number) } else { "Episodio".to_string() });
 
             episodes.push(Episode {
                 id,
-                number: episode_number,
-                title: episode_title,
+                number,
+                title,
                 url: full_url,
             });
         }
 
-        episodes.reverse();
+        // ordena por número ascendente (seguro y claro)
+        episodes.sort_by_key(|e| e.number);
         Ok(episodes)
     })
     .await
@@ -229,39 +277,49 @@ pub async fn get_episodes(anime_id: &str) -> Result<Vec<Episode>> {
 
 pub async fn get_video_sources(episode_id: &str) -> Result<Vec<VideoSource>, Box<dyn Error>> {
     let client = custom_client().await?;
-    let url = format!("{}/ver/{}", BASE_URL, episode_id);
+    let episode_parse = episode_id.replace("*", "/");
+    let url = format!("{}/media/{}", BASE_URL, episode_parse);
     let html = client.get(&url).send().await?.text().await?;
 
+    // Guardamos HTML para debug
+    std::fs::write("episode_sources.html", &html)?;
+
     let document = Html::parse_document(&html);
-    
-    // Selecciona todas las opciones (li) que contienen info del servidor
-    let option_selector = Selector::parse("ul.CapiTnv li").unwrap();
-    let iframe_selector = Selector::parse("div#video_box iframe, div.tab-pane iframe").unwrap();
-    
+
+    // Selector para el iframe actual (el video embed)
+    let iframe_selector = Selector::parse("div iframe").unwrap();
+    // Selector para los botones de servidores
+    let button_selector = Selector::parse("div.flex-1.flex-wrap button").unwrap();
+
     let mut sources = Vec::new();
 
-    //escritra para debuggin
-    std::fs::write("episodes_rendered.html", &html).context("Error al guardar HTML")?;
+    // 1) Obtenemos el iframe activo (el que está mostrando el video actual)
+    let iframe_src = document
+        .select(&iframe_selector)
+        .next()
+        .and_then(|iframe| iframe.value().attr("src"))
+        .unwrap_or("")
+        .to_string();
 
-    // Recorremos cada <li> para obtener nombre y asociar iframe
-    for (index, option) in document.select(&option_selector).enumerate() {
-        let server = option.value()
-            .attr("data-original-title")
-            .unwrap_or("Desconocido")
-            .to_string();
+    // 2) Recorremos los botones de servidores
+    for button in document.select(&button_selector) {
+        let server = button.text().collect::<String>().trim().to_string();
 
-        // Buscar iframe correspondiente por posición
-        if let Some(iframe) = document.select(&iframe_selector).nth(index) {
-            if let Some(src) = iframe.value().attr("src") {
-                sources.push(VideoSource {
-                    server,
-                    url: src.to_string(),
-                    quality: None, // aquí podrías analizar calidad si la tienes
-                });
-            }
-        }
+        // Si coincide con el que está activo, le asignamos el iframe actual
+        let is_active = button.value().classes().any(|c| c == "bg-main");
+        let url = if is_active {
+            iframe_src.clone()
+        } else {
+            // Los otros servidores no tienen el iframe en el HTML estático, dejado de esta manera hasta solucionarlo
+            String::from("NEEDS_JS_RENDERING")
+        };
+
+        sources.push(VideoSource {
+            server,
+            url,
+            quality: None,
+        });
     }
 
     Ok(sources)
 }
-
