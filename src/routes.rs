@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use crate::scraping;
-use crate::models::{Anime, Episode, VideoSource};
+use crate::structs::{Anime, Episode, VideoSource};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {

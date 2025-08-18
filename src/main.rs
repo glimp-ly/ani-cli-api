@@ -1,6 +1,6 @@
 mod routes;
 mod scraping;
-mod models;
+mod structs;
 
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
