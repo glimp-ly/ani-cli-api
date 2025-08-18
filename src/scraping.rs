@@ -1,22 +1,26 @@
-use crate::models::{Anime, Episode, VideoSource};
+use crate::structs::{Anime, Episode, VideoSource};
 use reqwest::Client;
+use reqwest::dns::{Resolve, Resolving};
 use scraper::{Html, Selector};
-use std::error::Error;
-use std::net::SocketAddr;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
-use reqwest::dns::{Resolve, Resolving};
 use hyper::client::connect::dns::Name;
-use std::io;
-use std::sync::Arc;
 use headless_chrome::{Browser, LaunchOptions};
-use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
-use std::net::IpAddr;
 use once_cell::sync::Lazy;
+use tokio::task;
+use fantoccini::Locator;
+use std::process::Command;
+use std::error::Error;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::ffi::{OsStr, OsString};
-use tokio::task;
+use std::time::Duration;
+use std::io;
+use std::sync::Arc;
+use std::net::IpAddr;
+use std::fs;
+use serde_json::json;
 
 static DNS_CACHE: Lazy<Mutex<Option<IpAddr>>> = Lazy::new(|| Mutex::new(None));
 
@@ -275,51 +279,134 @@ pub async fn get_episodes(anime_id: &str) -> Result<Vec<Episode>> {
     Ok(episodes)
 }
 
+/* --------------------------------------------------- */
+/*        Verificaciones para el get sources          */
+/* ------------------------------------------------- */
+
+
+pub async fn ensure_chromedriver() -> Result<String, Box<dyn Error>> {
+    // 1. Verificar si está instalado en el PATH
+    if let Ok(output) = Command::new("which").arg("chromedriver").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Ok(path);
+        }
+    }
+
+    // 2. Si no está, descargarlo (ejemplo Linux x64, ChromeDriver v131)
+    let url = "https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.85/linux64/chromedriver-linux64.zip";
+    let zip_path = "./chromedriver.zip";
+    let bin_dir = "./bin";
+
+    // Descargar con reqwest
+    let bytes = reqwest::get(url).await?.bytes().await?;
+    fs::write(zip_path, &bytes)?;
+
+    // Extraer
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    archive.extract(bin_dir)?;
+
+    // El binario queda en ./bin/chromedriver-linux64/chromedriver
+    let driver_path = format!("{}/chromedriver-linux64/chromedriver", bin_dir);
+
+    Ok(driver_path)
+}
+
+pub async fn ensure_chrome() -> Result<String, Box<dyn std::error::Error>> {
+    // 1. Verificar si hay un Chrome/Chromium en el sistema
+    for bin in ["google-chrome", "chromium", "chromium-browser"] {
+        if let Ok(output) = Command::new("which").arg(bin).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                return Ok(path);
+            }
+        }
+    }
+
+    // 2. Si no está → descargar Chromium portable (ejemplo Linux x64, versión estable conocida)
+    let url = "https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.85/linux64/chrome-linux64.zip";
+    let zip_path = "./chrome.zip";
+    let bin_dir = "./bin";
+
+    println!("⬇️ Descargando Chromium portable...");
+    let bytes = reqwest::get(url).await?.bytes().await?;
+    std::fs::write(zip_path, &bytes)?;
+
+    // 3. Extraer
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    archive.extract(bin_dir)?;
+
+    // El binario queda en ./bin/chrome-linux64/chrome
+    let chrome_path = format!("{}/chrome-linux64/chrome", bin_dir);
+    
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&chrome_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&chrome_path, perms)?;
+
+    Ok(chrome_path)
+}
+
 pub async fn get_video_sources(episode_id: &str) -> Result<Vec<VideoSource>, Box<dyn Error>> {
-    let client = custom_client().await?;
+    // --- 1. Asegurar Chrome y Chromedriver ---
+    let driver_path = ensure_chromedriver().await?;
+    let chrome_path = ensure_chrome().await?;
+
+    // --- 2. Levantar chromedriver ---
+    let mut chromedriver = Command::new(driver_path.clone())
+        .arg("--port=9515")
+        .spawn()?;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    use serde_json::{json, Map, Value};
+
+    // --- 3. Configurar capabilities ---
+    let caps_value = json!({
+        "goog:chromeOptions": {
+            "binary": chrome_path,
+            "args": ["--headless", "--no-sandbox", "--disable-gpu"]
+        }
+    });
+
+    // convertir serde_json::Value -> Map<String, Value>
+    let caps: Map<String, Value> = caps_value.as_object().unwrap().clone();
+
+    // --- 4. Conectar con fantoccini ---
+    let client = fantoccini::ClientBuilder::native()
+        .capabilities(caps)
+        .connect("http://localhost:9515")
+        .await?;
+
     let episode_parse = episode_id.replace("*", "/");
     let url = format!("{}/media/{}", BASE_URL, episode_parse);
-    let html = client.get(&url).send().await?.text().await?;
 
-    // Guardamos HTML para debug
-    std::fs::write("episode_sources.html", &html)?;
+    client.goto(&url).await?;
 
-    let document = Html::parse_document(&html);
-
-    // Selector para el iframe actual (el video embed)
-    let iframe_selector = Selector::parse("div iframe").unwrap();
-    // Selector para los botones de servidores
-    let button_selector = Selector::parse("div.flex-1.flex-wrap button").unwrap();
+    // --- 5. Recolectar servidores ---
+    client.wait().for_element(Locator::Css("div.flex.flex-1.flex-wrap button")).await?;
+    let buttons = client.find_all(Locator::Css("div.flex.flex-1.flex-wrap button")).await?;
 
     let mut sources = Vec::new();
 
-    // 1) Obtenemos el iframe activo (el que está mostrando el video actual)
-    let iframe_src = document
-        .select(&iframe_selector)
-        .next()
-        .and_then(|iframe| iframe.value().attr("src"))
-        .unwrap_or("")
-        .to_string();
+    for btn in buttons {
+        let server_name = btn.text().await?.trim().to_string();
+        btn.click().await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // 2) Recorremos los botones de servidores
-    for button in document.select(&button_selector) {
-        let server = button.text().collect::<String>().trim().to_string();
-
-        // Si coincide con el que está activo, le asignamos el iframe actual
-        let is_active = button.value().classes().any(|c| c == "bg-main");
-        let url = if is_active {
-            iframe_src.clone()
-        } else {
-            // Los otros servidores no tienen el iframe en el HTML estático, dejado de esta manera hasta solucionarlo
-            String::from("NEEDS_JS_RENDERING")
-        };
-
-        sources.push(VideoSource {
-            server,
-            url,
-            quality: None,
-        });
+        if let Ok(iframe) = client.find(Locator::Css("iframe")).await {
+            if let Some(src) = iframe.attr("src").await? {
+                sources.push(VideoSource {
+                    server: server_name,
+                    url: src,
+                    quality: None,
+                });
+            }
+        }
     }
+
+    client.close().await?;
+    chromedriver.kill()?; // cerrar proceso de chromedriver
 
     Ok(sources)
 }
