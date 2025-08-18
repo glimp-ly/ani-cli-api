@@ -2,3 +2,5 @@
 Cargo.lock
 .cargo/
 *.html
+bin/
+*.zip
