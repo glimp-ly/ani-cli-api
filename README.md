@@ -8,9 +8,9 @@ Hasta el momento ya se puede obtener tanto los animes por criterios buscados y l
 ## TO-DO
 - [x] Recibir respuestas de los animes por criterio de busqueda en el nombre.
 - [x] Recibir respuestas de los episodios de un anime especifico.
-- [ ] Recibir las fuentes de un capitulo especifico (Parcialmente realizado).
+- [x] Recibir las fuentes de un capitulo especifico.
 - [ ] Permitir al usuario agregar fuentes propias.
 - [ ] Guardar previas conexiones para optimizar tiempos de carga.
 
 ## Contribuciones
-Puedes realizar contribuciones hacinedo el fork y la pullrequest, ayuda al desarrollo del proyecto.
+Puedes realizar contribuciones haciendo el fork y la pullrequest, ayuda al desarrollo del proyecto.
