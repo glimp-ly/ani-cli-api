@@ -9,7 +9,7 @@ use headless_chrome::{Browser, LaunchOptions};
 use anyhow::{anyhow, Context, Result};
 use once_cell::sync::Lazy;
 use tokio::task;
-use fantoccini::Locator;
+use fantoccini::{ClientBuilder, Locator};
 use std::process::Command;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -19,8 +19,7 @@ use std::time::Duration;
 use std::io;
 use std::sync::Arc;
 use std::net::IpAddr;
-use std::fs;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 
 static DNS_CACHE: Lazy<Mutex<Option<IpAddr>>> = Lazy::new(|| Mutex::new(None));
 
@@ -283,83 +282,28 @@ pub async fn get_episodes(anime_id: &str) -> Result<Vec<Episode>> {
 /*        Verificaciones para el get sources          */
 /* ------------------------------------------------- */
 
-
-pub async fn ensure_chromedriver() -> Result<String, Box<dyn Error>> {
-    // 1. Verificar si está instalado en el PATH
-    if let Ok(output) = Command::new("which").arg("chromedriver").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Ok(path);
-        }
-    }
-
-    // 2. Si no está, descargarlo (ejemplo Linux x64, ChromeDriver v131)
-    let url = "https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.85/linux64/chromedriver-linux64.zip";
-    let zip_path = "./chromedriver.zip";
-    let bin_dir = "./bin";
-
-    // Descargar con reqwest
-    let bytes = reqwest::get(url).await?.bytes().await?;
-    fs::write(zip_path, &bytes)?;
-
-    // Extraer
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    archive.extract(bin_dir)?;
-
-    // El binario queda en ./bin/chromedriver-linux64/chromedriver
-    let driver_path = format!("{}/chromedriver-linux64/chromedriver", bin_dir);
-
-    Ok(driver_path)
-}
-
-pub async fn ensure_chrome() -> Result<String, Box<dyn std::error::Error>> {
-    // 1. Verificar si hay un Chrome/Chromium en el sistema
-    for bin in ["google-chrome", "chromium", "chromium-browser"] {
-        if let Ok(output) = Command::new("which").arg(bin).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                return Ok(path);
-            }
-        }
-    }
-
-    // 2. Si no está → descargar Chromium portable (ejemplo Linux x64, versión estable conocida)
-    let url = "https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.85/linux64/chrome-linux64.zip";
-    let zip_path = "./chrome.zip";
-    let bin_dir = "./bin";
-
-    println!("⬇️ Descargando Chromium portable...");
-    let bytes = reqwest::get(url).await?.bytes().await?;
-    std::fs::write(zip_path, &bytes)?;
-
-    // 3. Extraer
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
-    archive.extract(bin_dir)?;
-
-    // El binario queda en ./bin/chrome-linux64/chrome
-    let chrome_path = format!("{}/chrome-linux64/chrome", bin_dir);
-    
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(&chrome_path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&chrome_path, perms)?;
-
-    Ok(chrome_path)
-}
-
 pub async fn get_video_sources(episode_id: &str) -> Result<Vec<VideoSource>, Box<dyn Error>> {
-    // --- 1. Asegurar Chrome y Chromedriver ---
-    let driver_path = ensure_chromedriver().await?;
-    let chrome_path = ensure_chrome().await?;
+    // --- 1. Verificar dependencias ---
+    fn check_bin(bin: &str) -> Result<String, Box<dyn Error>> {
+        let output = Command::new("which").arg(bin).output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(format!("No se encontró `{}` en el sistema. Instálalo antes de usar este proyecto.", bin).into())
+        }
+    }
+
+    let driver_path = check_bin("chromedriver")?;
+    let chrome_path = check_bin("chromium-browser")
+        .or_else(|_| check_bin("chromium"))
+        .or_else(|_| check_bin("google-chrome"))?;
 
     // --- 2. Levantar chromedriver ---
-    let mut chromedriver = Command::new(driver_path.clone())
+    let mut chromedriver = Command::new(&driver_path)
         .arg("--port=9515")
         .spawn()?;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
-
-    use serde_json::{json, Map, Value};
 
     // --- 3. Configurar capabilities ---
     let caps_value = json!({
@@ -368,19 +312,16 @@ pub async fn get_video_sources(episode_id: &str) -> Result<Vec<VideoSource>, Box
             "args": ["--headless", "--no-sandbox", "--disable-gpu"]
         }
     });
-
-    // convertir serde_json::Value -> Map<String, Value>
     let caps: Map<String, Value> = caps_value.as_object().unwrap().clone();
 
     // --- 4. Conectar con fantoccini ---
-    let client = fantoccini::ClientBuilder::native()
+    let client = ClientBuilder::native()
         .capabilities(caps)
         .connect("http://localhost:9515")
         .await?;
 
     let episode_parse = episode_id.replace("*", "/");
     let url = format!("{}/media/{}", BASE_URL, episode_parse);
-
     client.goto(&url).await?;
 
     // --- 5. Recolectar servidores ---
@@ -391,9 +332,29 @@ pub async fn get_video_sources(episode_id: &str) -> Result<Vec<VideoSource>, Box
 
     for btn in buttons {
         let server_name = btn.text().await?.trim().to_string();
-        btn.click().await?;
+
+        // Convertir el ElementId a String
+        let btn_id = btn.element_id().to_string();
+        let btn_arg = json!({ "element-6066-11e4-a52e-4f735466cecf": btn_id });
+
+        // Hacer scroll hasta el botón
+        let _ = client
+            .execute("arguments[0].scrollIntoView(true);", vec![btn_arg.clone()])
+            .await;
+
+        // Intentar click normal
+        let click_res = btn.click().await;
+
+        // Si falla, usar JS click
+        if click_res.is_err() {
+            client
+                .execute("arguments[0].click();", vec![btn_arg.clone()])
+                .await?;
+        }
+
         tokio::time::sleep(Duration::from_secs(2)).await;
 
+        // Extraer iframe
         if let Ok(iframe) = client.find(Locator::Css("iframe")).await {
             if let Some(src) = iframe.attr("src").await? {
                 sources.push(VideoSource {
